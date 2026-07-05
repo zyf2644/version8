@@ -75,6 +75,10 @@
       debugInfo.textContent = message;
     }
 
+    function markInputAlive() {
+      return performance.now() * 0.001;
+    }
+
     function loadScript(urls, timeout = 10000) {
       return new Promise((resolve, reject) => {
         let index = 0;
@@ -214,6 +218,8 @@
       const MAX_BUBBLES = 5;
       const MAX_POINTERS = 10;
       const bubbleData = new Float32Array(MAX_BUBBLES * 4);
+      const bubbleBirthTimes = new Float32Array(MAX_BUBBLES);
+      const bubbleBurstTimes = new Float32Array(MAX_BUBBLES);
       const fingertipIndices = [4, 8, 12, 16, 20];
       const fingerVectors = Array.from({ length: MAX_POINTERS }, () => new THREE.Vector4(-10, -10, 0, 0));
       const pointerState = Array.from({ length: MAX_POINTERS }, () => ({
@@ -227,6 +233,10 @@
       let mouseFallback = false;
       let mouseDown = false;
       let lastGrabState = false;
+      let inactiveTime = 0;
+      let mouseIdleTime = 0;
+      let lastInputTime = markInputAlive();
+      let lastSpawnTime = -10;
       const mousePointer = new THREE.Vector2(0.5, 0.5);
 
       const simMaterial = new THREE.ShaderMaterial({
@@ -238,7 +248,8 @@
           uPointers: { value: Array.from({ length: MAX_POINTERS }, () => new THREE.Vector4(-10, -10, 0, 0)) },
           uPointerCount: { value: 0 },
           uBubbleData: { value: bubbleData },
-          uTime: { value: 0 }
+          uTime: { value: 0 },
+          uClearMix: { value: 0 }
         },
         vertexShader: `
           varying vec2 vUv;
@@ -257,6 +268,7 @@
           uniform vec4 uPointers[10];
           uniform int uPointerCount;
           uniform float uBubbleData[20];
+          uniform float uClearMix;
 
           void main() {
             float curr = texture2D(uCurrTexture, vUv).r;
@@ -284,7 +296,9 @@
             float laplacian = (left + right + up + down) - 4.0 * curr;
 
             float next = 2.0 * curr - prev + 0.24 * laplacian;
-            next *= 0.978;
+            float damping = mix(0.982, 0.86, uClearMix);
+            next *= damping;
+            next = mix(next, 0.0, uClearMix * 0.08);
 
             for (int i = 0; i < 5; i++) {
               float bx = uBubbleData[i * 4];
@@ -298,14 +312,14 @@
                 float bDist = length(bDelta);
 
                 if (life >= 1.0) {
-                  float centerBump = exp(-pow(bDist / max(bRadius * 0.7, 0.0001), 2.0)) * 0.25;
-                  float edgeRing = exp(-pow((bDist - bRadius * 0.85) / max(bRadius * 0.15, 0.0001), 2.0)) * 0.35;
-                  float bubbleShape = centerBump + edgeRing;
-                  float mask = smoothstep(bRadius * 1.1, bRadius * 0.8, bDist);
-                  next = mix(next, bubbleShape, mask * 0.6);
+                  float dome = exp(-pow(bDist / max(bRadius * 0.92, 0.0001), 2.0)) * 0.055;
+                  float rim = exp(-pow((bDist - bRadius * 0.90) / max(bRadius * 0.14, 0.0001), 2.0)) * 0.040;
+                  float bubbleShape = dome + rim;
+                  float mask = smoothstep(bRadius * 1.12, bRadius * 0.74, bDist);
+                  next = mix(next, next + bubbleShape, mask * 0.30);
                 } else {
-                  float popRadius = bRadius * (2.0 - life);
-                  float popWave = exp(-pow(bDist - popRadius, 2.0) * 80.0) * life * 0.5;
+                  float popRadius = mix(bRadius * 0.92, bRadius * 1.35, 1.0 - life);
+                  float popWave = exp(-pow(bDist - popRadius, 2.0) * 120.0) * (0.35 + life) * 0.24;
                   next += popWave;
                 }
               }
@@ -322,7 +336,8 @@
           uVideoTexture: { value: videoTexture },
           uTexelSize: { value: new THREE.Vector2(1 / width, 1 / height) },
           uBubbleData: { value: bubbleData },
-          uAspect: { value: width / height }
+          uAspect: { value: width / height },
+          uTime: { value: 0 }
         },
         vertexShader: `
           varying vec2 vUv;
@@ -339,6 +354,7 @@
           uniform vec2 uTexelSize;
           uniform float uBubbleData[20];
           uniform float uAspect;
+          uniform float uTime;
 
           void main() {
             float h = texture2D(uHeightTexture, vUv).r;
@@ -377,26 +393,72 @@
                 vec2 bDelta = vUv - vec2(bx, by);
                 bDelta.x *= uAspect;
                 float bDist = length(bDelta);
-                float currentRadius = bRadius;
+                float currentRadius = life >= 1.0 ? bRadius : mix(bRadius * 0.95, bRadius * 1.32, 1.0 - life);
 
-                if (bDist < currentRadius * 1.3) {
-                  float edge = smoothstep(currentRadius * 1.1, currentRadius * 0.8, bDist);
-                  float edgeHighlight = pow(edge, 3.0) * 1.5;
+                if (bDist < currentRadius * 1.18) {
+                  float angle = atan(bDelta.y, bDelta.x);
+                  float radiusNoise =
+                    0.030 * sin(angle * 7.0 + uTime * 1.25 + bx * 12.0) +
+                    0.020 * sin(angle * 11.0 - uTime * 0.85 + by * 9.0) +
+                    0.014 * sin(angle * 17.0 + uTime * 0.55);
 
-                  vec2 lightOffset = vec2(-currentRadius * 0.4, currentRadius * 0.4);
-                  float topSpec = exp(-pow(length(bDelta - lightOffset) / max(currentRadius * 0.25, 0.0001), 2.0));
+                  float warpedRadius = currentRadius * (1.0 + radiusNoise);
+                  float shellDistance = abs(bDist - warpedRadius);
+                  float shellWidth = max(currentRadius * 0.060, 0.0030);
+                  float shell = 1.0 - smoothstep(shellWidth, shellWidth * 1.8, shellDistance);
 
-                  vec2 bottomOffset = vec2(currentRadius * 0.3, -currentRadius * 0.3);
-                  float bottomSpec = exp(-pow(length(bDelta - bottomOffset) / max(currentRadius * 0.3, 0.0001), 2.0)) * 0.5;
+                  float sphereMask = 1.0 - smoothstep(currentRadius * 0.06, currentRadius * 1.02, bDist);
+                  float innerMask = 1.0 - smoothstep(currentRadius * 0.12, currentRadius * 0.94, bDist);
+                  vec2 direction = bDist > 0.0001 ? bDelta / bDist : vec2(0.0);
 
-                  float alpha = (edgeHighlight + topSpec + bottomSpec) * max(life, 0.25);
-                  finalColor += vec3(0.9, 0.95, 1.0) * alpha;
+                  vec2 lensUV = clamp(
+                    vUv
+                    + direction * sphereMask * currentRadius * 0.11
+                    + vec2(
+                      sin(angle * 5.0 + uTime * 1.4),
+                      cos(angle * 6.0 - uTime * 1.1)
+                    ) * shell * 0.010,
+                    0.0,
+                    1.0
+                  );
+                  vec3 refracted = texture2D(uVideoTexture, lensUV).rgb;
 
-                  if (bDist < currentRadius * 0.95) {
-                    vec2 direction = bDist > 0.0001 ? bDelta / bDist : vec2(0.0);
-                    vec2 bubbleRefract = clamp(vUv + direction * 0.02 * max(life, 0.25), 0.0, 1.0);
-                    vec3 bubbleColor = texture2D(uVideoTexture, bubbleRefract).rgb;
-                    finalColor = mix(finalColor, bubbleColor * 1.2, 0.4 * max(life, 0.25));
+                  float cap = clamp(1.0 - pow(bDist / max(currentRadius, 0.0001), 2.0), 0.0, 1.0);
+                  vec3 bubbleNormal = normalize(vec3(
+                    direction.x * (1.0 - cap) * 1.2,
+                    direction.y * (1.0 - cap) * 1.2,
+                    sqrt(max(cap, 0.0))
+                  ));
+
+                  vec3 bubbleLight = normalize(vec3(-0.35, 0.45, 1.0));
+                  vec3 bubbleHalf = normalize(bubbleLight + vec3(0.0, 0.0, 1.0));
+                  float bubbleSpec = pow(max(dot(bubbleNormal, bubbleHalf), 0.0), 48.0);
+                  float bubbleFresnel = pow(1.0 - max(dot(bubbleNormal, vec3(0.0, 0.0, 1.0)), 0.0), 3.5);
+
+                  float innerLobeA = exp(-pow(length(bDelta - vec2(-currentRadius * 0.20, currentRadius * 0.22)) / max(currentRadius * 0.20, 0.0001), 2.0));
+                  float innerLobeB = exp(-pow(length(bDelta - vec2(currentRadius * 0.12, -currentRadius * 0.10)) / max(currentRadius * 0.28, 0.0001), 2.0));
+                  float shadowPocket = exp(-pow(length(bDelta - vec2(currentRadius * 0.24, -currentRadius * 0.24)) / max(currentRadius * 0.48, 0.0001), 2.0));
+
+                  vec3 bubbleTint = mix(
+                    vec3(0.06, 0.09, 0.14),
+                    vec3(0.18, 0.24, 0.34),
+                    cap
+                  );
+                  float bodyMix = life >= 1.0 ? 1.0 : life;
+                  vec3 bubbleBody = mix(finalColor, refracted * 1.04 + bubbleTint, innerMask * 0.48 * bodyMix);
+                  bubbleBody += vec3(0.95, 0.98, 1.0) * innerLobeA * 0.18 * bodyMix;
+                  bubbleBody += vec3(0.70, 0.84, 1.0) * innerLobeB * 0.12 * bodyMix;
+                  bubbleBody -= vec3(0.03, 0.04, 0.06) * shadowPocket * 0.55 * innerMask * bodyMix;
+                  bubbleBody += vec3(0.88, 0.94, 1.0) * bubbleSpec * 0.22 * max(bodyMix, 0.35);
+                  bubbleBody += vec3(0.70, 0.82, 0.96) * bubbleFresnel * 0.12 * max(bodyMix, 0.35);
+
+                  vec3 rimColor = vec3(0.96, 0.98, 1.0) * shell * mix(0.30, 0.16, 1.0 - min(life, 1.0));
+                  finalColor = mix(finalColor, bubbleBody, sphereMask * 0.72 * bodyMix);
+                  finalColor += rimColor;
+
+                  if (life < 1.0) {
+                    float popShell = 1.0 - smoothstep(currentRadius * 0.05, currentRadius * 0.16, abs(bDist - currentRadius));
+                    finalColor += vec3(0.92, 0.97, 1.0) * popShell * (0.22 + life) * 0.36;
                   }
                 }
               }
@@ -407,30 +469,53 @@
         `
       });
 
-      simScene.add(new THREE.Mesh(quadGeo, simMaterial));
-      displayScene.add(new THREE.Mesh(quadGeo, displayMaterial));
+      const simQuad = new THREE.Mesh(quadGeo, simMaterial);
+      simScene.add(simQuad);
 
-      function resetFingerVectors() {
-        for (let i = 0; i < MAX_POINTERS; i++) {
-          fingerVectors[i].set(-10, -10, 0, 0);
+      const displayQuad = new THREE.Mesh(quadGeo, displayMaterial);
+      displayScene.add(displayQuad);
+
+      function clearBubble(index) {
+        bubbleData[index * 4] = 0.0;
+        bubbleData[index * 4 + 1] = 0.0;
+        bubbleData[index * 4 + 2] = 0.0;
+        bubbleData[index * 4 + 3] = 0.0;
+        bubbleBirthTimes[index] = 0.0;
+        bubbleBurstTimes[index] = 0.0;
+      }
+
+      function clearAllBubbles() {
+        for (let i = 0; i < MAX_BUBBLES; i++) {
+          clearBubble(i);
         }
       }
 
-      function addBubble(x, y) {
+      function hasAnyBubble() {
         for (let i = 0; i < MAX_BUBBLES; i++) {
-          if (bubbleData[i * 4 + 3] <= 0.0) {
-            bubbleData[i * 4] = x;
-            bubbleData[i * 4 + 1] = y;
-            bubbleData[i * 4 + 2] = 0.07;
-            bubbleData[i * 4 + 3] = 1.0;
-            return;
+          if (bubbleData[i * 4 + 2] > 0.0 && bubbleData[i * 4 + 3] > 0.0) {
+            return true;
           }
+        }
+        return false;
+      }
+
+      function addBubble(x, y) {
+        const now = markInputAlive();
+        if (now - lastSpawnTime < 0.28) {
+          return;
+        }
+
+        if (hasAnyBubble()) {
+          return;
         }
 
         bubbleData[0] = x;
         bubbleData[1] = y;
         bubbleData[2] = 0.07;
         bubbleData[3] = 1.0;
+        bubbleBirthTimes[0] = now;
+        bubbleBurstTimes[0] = 0.0;
+        lastSpawnTime = now;
       }
 
       function popTouchedBubbles() {
@@ -449,8 +534,10 @@
               const dy = fy - by;
               const dist = Math.hypot(dx, dy);
 
-              if (dist < bRadius) {
-                bubbleData[i * 4 + 3] = 0.95;
+              if (dist < bRadius * 1.65) {
+                bubbleData[i * 4 + 3] = 0.22;
+                bubbleBirthTimes[i] = 0.0;
+                bubbleBurstTimes[i] = markInputAlive();
               }
             }
           }
@@ -468,6 +555,8 @@
         fingerVectors[0].set(pointerState[0].current.x, pointerState[0].current.y, velocity, 1.0);
         pointerState[0].previous.copy(pointerState[0].current);
         activeFingersCount = 1;
+        mouseIdleTime = 0;
+        lastInputTime = markInputAlive();
       }
 
       function enableMouseFallback(message) {
@@ -475,9 +564,18 @@
         mouseFallback = true;
         activeFingersCount = 0;
         currentState = 0;
+        mouseIdleTime = 0;
         lastGrabState = false;
         resetFingerVectors();
         setDebug(message);
+      }
+
+      function resetFingerVectors() {
+        for (let i = 0; i < MAX_POINTERS; i++) {
+          fingerVectors[i].set(-10, -10, 0, 0);
+          pointerState[i].current.set(0.5, 0.5);
+          pointerState[i].previous.set(0.5, 0.5);
+        }
       }
 
       window.addEventListener("pointermove", (event) => {
@@ -491,6 +589,7 @@
         mouseDown = true;
         updateMousePointer(event);
         currentState = 1;
+        lastInputTime = markInputAlive();
         if (!lastGrabState) {
           addBubble(pointerState[0].current.x, pointerState[0].current.y);
           lastGrabState = true;
@@ -501,7 +600,10 @@
         if (!mouseFallback) return;
         mouseDown = false;
         currentState = 0;
+        activeFingersCount = 0;
+        mouseIdleTime = 0;
         lastGrabState = false;
+        resetFingerVectors();
       });
 
       async function initCameraStream() {
@@ -513,6 +615,7 @@
         await videoElement.play();
         usingCamera = true;
         mouseFallback = false;
+        lastInputTime = markInputAlive();
         setDebug("Camera active. Loading hand tracking...");
       }
 
@@ -548,27 +651,24 @@
             let anyHandGrabbing = false;
             let grabCenterX = 0.5;
             let grabCenterY = 0.5;
+            lastInputTime = markInputAlive();
 
             for (let h = 0; h < results.multiHandLandmarks.length; h++) {
               const landmarks = results.multiHandLandmarks[h];
               const palmRef = landmarks[9];
-              let handOpenCount = 0;
-              let avgDistToPalm = 0;
-              let handCenterX = 0;
-              let handCenterY = 0;
+              const thumbTip = landmarks[4];
+              const indexTip = landmarks[8];
+              const pinchDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+              const isPinching = pinchDist < 0.055;
 
               for (let i = 0; i < 5 && activeFingersCount < MAX_POINTERS; i++) {
                 const tipIdx = fingertipIndices[i];
                 const tip = landmarks[tipIdx];
                 const distToPalm = Math.hypot(tip.x - palmRef.x, tip.y - palmRef.y);
-                avgDistToPalm += distToPalm;
-
                 const targetX = tip.x;
                 const targetY = 1.0 - tip.y;
-                handCenterX += targetX;
-                handCenterY += targetY;
 
-                if (distToPalm > 0.15) {
+                if (!isPinching && distToPalm > 0.16) {
                   const state = pointerState[activeFingersCount];
                   state.current.x += (targetX - state.current.x) * 0.3;
                   state.current.y += (targetY - state.current.y) * 0.3;
@@ -582,18 +682,13 @@
                   );
                   state.previous.copy(state.current);
                   activeFingersCount += 1;
-                  handOpenCount += 1;
                 }
               }
 
-              avgDistToPalm /= 5;
-              handCenterX /= 5;
-              handCenterY /= 5;
-
-              if (avgDistToPalm < 0.115 || handOpenCount <= 1) {
+              if (isPinching) {
                 anyHandGrabbing = true;
-                grabCenterX = handCenterX;
-                grabCenterY = handCenterY;
+                grabCenterX = (thumbTip.x + indexTip.x) * 0.5;
+                grabCenterY = 1.0 - (thumbTip.y + indexTip.y) * 0.5;
               }
             }
 
@@ -630,24 +725,61 @@
       function animate() {
         requestAnimationFrame(animate);
         const time = clock.getElapsedTime();
+        const dt = Math.min(clock.getDelta(), 0.05);
 
         if (mouseFallback) {
-          if (!mouseDown && activeFingersCount > 0) {
+          mouseIdleTime += dt;
+          const canPopWithMouse = !mouseDown && activeFingersCount > 0 && hasAnyBubble();
+
+          if (mouseDown && mouseIdleTime > 0.16) {
+            mouseDown = false;
+            currentState = 0;
+            lastGrabState = false;
+          }
+
+          if (canPopWithMouse) {
             currentState = 0;
             popTouchedBubbles();
           }
+
+          if (!mouseDown && mouseIdleTime > 0.12) {
+            activeFingersCount = 0;
+            resetFingerVectors();
+          }
+
           if (mouseDown) {
             currentState = 1;
           }
         }
 
-        for (let i = 0; i < MAX_BUBBLES; i++) {
+        inactiveTime = Math.max(0.0, markInputAlive() - lastInputTime);
+
+        if (inactiveTime >= 1.9) {
+          clearAllBubbles();
+          clearTarget(prevTarget);
+          clearTarget(currTarget);
+          clearTarget(nextTarget);
+          renderer.setRenderTarget(null);
+        }
+
+        for (let i = 0; i < 1; i++) {
           const life = bubbleData[i * 4 + 3];
+          if (life >= 1.0 && bubbleBirthTimes[i] > 0.0 && time - bubbleBirthTimes[i] >= 2.0) {
+            bubbleData[i * 4 + 3] = 0.22;
+            bubbleBirthTimes[i] = 0.0;
+            bubbleBurstTimes[i] = time;
+          }
+          if (inactiveTime > 1.0 && life >= 1.0) {
+            bubbleData[i * 4 + 3] = Math.max(0.0, 1.0 - (inactiveTime - 1.0) * 1.8);
+          }
           if (life > 0.0 && life < 1.0) {
-            bubbleData[i * 4 + 3] -= 0.04;
+            if (bubbleBurstTimes[i] > 0.0 && time - bubbleBurstTimes[i] >= 0.18) {
+              clearBubble(i);
+              continue;
+            }
+            bubbleData[i * 4 + 3] -= dt * 5.5;
             if (bubbleData[i * 4 + 3] <= 0.0) {
-              bubbleData[i * 4 + 3] = 0.0;
-              bubbleData[i * 4 + 2] = 0.0;
+              clearBubble(i);
             }
           }
         }
@@ -658,6 +790,8 @@
         simMaterial.uniforms.uCurrTexture.value = currTarget.texture;
         simMaterial.uniforms.uPointerCount.value = currentState === 0 ? activeFingersCount : 0;
         simMaterial.uniforms.uTime.value = time;
+        simMaterial.uniforms.uClearMix.value = Math.min(inactiveTime / 2.0, 1.0);
+        displayMaterial.uniforms.uTime.value = time;
 
         for (let i = 0; i < MAX_POINTERS; i++) {
           simMaterial.uniforms.uPointers.value[i].copy(fingerVectors[i]);
@@ -674,6 +808,16 @@
         prevTarget = currTarget;
         currTarget = nextTarget;
         nextTarget = oldPrev;
+
+        window.__liquidDebug = {
+          currentState,
+          activeFingersCount,
+          mouseDown,
+          inactiveTime,
+          mouseIdleTime,
+          pointerCount: simMaterial.uniforms.uPointerCount.value,
+          bubbles: Array.from(bubbleData)
+        };
 
         displayMaterial.uniforms.uHeightTexture.value = currTarget.texture;
 
