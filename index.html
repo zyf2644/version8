@@ -469,11 +469,14 @@
         `
       });
 
-      const simQuad = new THREE.Mesh(quadGeo, simMaterial);
-      simScene.add(simQuad);
+      simScene.add(new THREE.Mesh(quadGeo, simMaterial));
+      displayScene.add(new THREE.Mesh(quadGeo, displayMaterial));
 
-      const displayQuad = new THREE.Mesh(quadGeo, displayMaterial);
-      displayScene.add(displayQuad);
+      function resetFingerVectors() {
+        for (let i = 0; i < MAX_POINTERS; i++) {
+          fingerVectors[i].set(-10, -10, 0, 0);
+        }
+      }
 
       function clearBubble(index) {
         bubbleData[index * 4] = 0.0;
@@ -492,7 +495,7 @@
 
       function hasAnyBubble() {
         for (let i = 0; i < MAX_BUBBLES; i++) {
-          if (bubbleData[i * 4 + 2] > 0.0 && bubbleData[i * 4 + 3] > 0.0) {
+          if (bubbleData[i * 4 + 3] > 0.0) {
             return true;
           }
         }
@@ -568,14 +571,6 @@
         lastGrabState = false;
         resetFingerVectors();
         setDebug(message);
-      }
-
-      function resetFingerVectors() {
-        for (let i = 0; i < MAX_POINTERS; i++) {
-          fingerVectors[i].set(-10, -10, 0, 0);
-          pointerState[i].current.set(0.5, 0.5);
-          pointerState[i].previous.set(0.5, 0.5);
-        }
       }
 
       window.addEventListener("pointermove", (event) => {
@@ -664,14 +659,26 @@
               for (let i = 0; i < 5 && activeFingersCount < MAX_POINTERS; i++) {
                 const tipIdx = fingertipIndices[i];
                 const tip = landmarks[tipIdx];
+                const pipIdx = tipIdx === 4 ? 3 : tipIdx - 2;
+                const pip = landmarks[pipIdx];
                 const distToPalm = Math.hypot(tip.x - palmRef.x, tip.y - palmRef.y);
                 const targetX = tip.x;
                 const targetY = 1.0 - tip.y;
+                let isExtended = false;
 
-                if (!isPinching && distToPalm > 0.16) {
+                if (tipIdx === 4) {
+                  const thumbSpread = Math.hypot(tip.x - landmarks[2].x, tip.y - landmarks[2].y);
+                  isExtended = thumbSpread > 0.11 && distToPalm > 0.09;
+                } else {
+                  const verticalOpen = tip.y < pip.y - 0.015;
+                  const distanceOpen = distToPalm > 0.10;
+                  isExtended = verticalOpen && distanceOpen;
+                }
+
+                if (!isPinching && isExtended) {
                   const state = pointerState[activeFingersCount];
-                  state.current.x += (targetX - state.current.x) * 0.3;
-                  state.current.y += (targetY - state.current.y) * 0.3;
+                  state.current.x += (targetX - state.current.x) * 0.30;
+                  state.current.y += (targetY - state.current.y) * 0.30;
 
                   const velocity = state.current.distanceTo(state.previous);
                   fingerVectors[activeFingersCount].set(
