@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Liquid Bubble Interaction - Fixed</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      inset: 0;
+      z-index: 10;
+    }
+    #video { display: none; }
+    .hud {
+      position: fixed;
+      left: 20px;
+      top: 20px;
+      z-index: 20;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.46);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 15px;
+      border-radius: 12px;
+      pointer-events: none;
+      backdrop-filter: blur(5px);
+      max-width: min(360px, calc(100vw - 40px));
+    }
+    .hud h1 {
+      font-size: 16px;
+      margin-bottom: 5px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    .hud p {
+      font-size: 12px;
+      opacity: 0.85;
+      line-height: 1.4;
+    }
+    .status {
+      color: #63d7ff;
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <div class="hud">
+    <h1>Liquid Bubble Interaction</h1>
+    <p>
+      1. Move fingers to ripple.<br />
+      2. <span class="status">Grab (Pinch)</span> to spawn a bubble.<br />
+      3. <span class="status">Touch</span> bubble with finger to pop it.
+    </p>
+    <p id="debug-info" style="margin-top:10px;color:#ffd966;">Loading renderer...</p>
+  </div>
+
+  <video id="video" playsinline autoplay muted></video>
+
+  <script type="module">
+    const videoElement = document.getElementById("video");
+    const debugInfo = document.getElementById("debug-info");
+
+    function setDebug(message) {
+      debugInfo.textContent = message;
+    }
+
+    function loadScript(urls, timeout = 10000) {
+      return new Promise((resolve, reject) => {
+        let index = 0;
+
+        const tryNext = () => {
+          if (index >= urls.length) {
+            reject(new Error(`Failed to load script: ${urls[urls.length - 1]}`));
+            return;
+          }
+
+          const script = document.createElement("script");
+          const url = urls[index++];
+          let settled = false;
+
+          const timer = window.setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            script.remove();
+            tryNext();
+          }, timeout);
+
+          script.src = url;
+          script.crossOrigin = "anonymous";
+          script.onload = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            resolve(url);
+          };
+          script.onerror = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            script.remove();
+            tryNext();
+          };
+
+          document.head.appendChild(script);
+        };
+
+        tryNext();
+      });
+    }
+
+    async function loadThree() {
+      const urls = [
+        "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+      ];
+
+      for (const url of urls) {
+        try {
+          return await import(url);
+        } catch (error) {
+          console.warn("Failed to import Three.js from", url, error);
+        }
+      }
+
+      throw new Error("Three.js CDN unavailable");
+    }
+
+    async function loadMediaPipe() {
+      const groups = [
+        [
+          "https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js",
+          "https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"
+        ],
+        [
+          "https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js",
+          "https://unpkg.com/@mediapipe/control_utils/control_utils.js"
+        ],
+        [
+          "https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js",
+          "https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js"
+        ],
+        [
+          "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js",
+          "https://unpkg.com/@mediapipe/hands/hands.js"
+        ]
+      ];
+
+      for (const group of groups) {
+        await loadScript(group);
+      }
+
+      if (!window.Hands || !window.Camera) {
+        throw new Error("MediaPipe globals unavailable");
+      }
+    }
+
+    async function main() {
+      const THREE = await loadThree();
+      setDebug("Loading scene...");
+
+      let width = window.innerWidth;
+      let height = window.innerHeight;
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(width, height);
+      document.body.appendChild(renderer.domElement);
+
+      const displayScene = new THREE.Scene();
+      const simScene = new THREE.Scene();
+      const displayCamera = new THREE.Camera();
+      const simCamera = new THREE.Camera();
+
+      const createTarget = () => new THREE.WebGLRenderTarget(width, height, {
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        type: THREE.HalfFloatType,
+        depthBuffer: false,
+        stencilBuffer: false
+      });
+
+      let prevTarget = createTarget();
+      let currTarget = createTarget();
+      let nextTarget = createTarget();
+
+      const clearTarget = (target) => {
+        renderer.setRenderTarget(target);
+        renderer.setClearColor(0x000000, 1);
+        renderer.clear(true, true, true);
+      };
+
+      clearTarget(prevTarget);
+      clearTarget(currTarget);
+      clearTarget(nextTarget);
+      renderer.setRenderTarget(null);
+
+      const videoTexture = new THREE.VideoTexture(videoElement);
+      videoTexture.minFilter = THREE.LinearFilter;
+      videoTexture.magFilter = THREE.LinearFilter;
+      videoTexture.colorSpace = THREE.SRGBColorSpace;
+
+      const quadGeo = new THREE.PlaneGeometry(2, 2);
+      const MAX_BUBBLES = 5;
+      const MAX_POINTERS = 10;
+      const bubbleData = new Float32Array(MAX_BUBBLES * 4);
+      const fingertipIndices = [4, 8, 12, 16, 20];
+      const fingerVectors = Array.from({ length: MAX_POINTERS }, () => new THREE.Vector4(-10, -10, 0, 0));
+      const pointerState = Array.from({ length: MAX_POINTERS }, () => ({
+        current: new THREE.Vector2(0.5, 0.5),
+        previous: new THREE.Vector2(0.5, 0.5)
+      }));
+
+      let activeFingersCount = 0;
+      let currentState = 0;
+      let usingCamera = false;
+      let mouseFallback = false;
+      let mouseDown = false;
+      let lastGrabState = false;
+      const mousePointer = new THREE.Vector2(0.5, 0.5);
+
+      const simMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+          uPrevTexture: { value: prevTarget.texture },
+          uCurrTexture: { value: currTarget.texture },
+          uTexelSize: { value: new THREE.Vector2(1 / width, 1 / height) },
+          uAspect: { value: width / height },
+          uPointers: { value: Array.from({ length: MAX_POINTERS }, () => new THREE.Vector4(-10, -10, 0, 0)) },
+          uPointerCount: { value: 0 },
+          uBubbleData: { value: bubbleData },
+          uTime: { value: 0 }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = vec4(position.xy, 0.0, 1.0);
+          }
+        `,
+        fragmentShader: `
+          precision highp float;
+          varying vec2 vUv;
+          uniform sampler2D uPrevTexture;
+          uniform sampler2D uCurrTexture;
+          uniform vec2 uTexelSize;
+          uniform float uAspect;
+          uniform vec4 uPointers[10];
+          uniform int uPointerCount;
+          uniform float uBubbleData[20];
+
+          void main() {
+            float curr = texture2D(uCurrTexture, vUv).r;
+            float prev = texture2D(uPrevTexture, vUv).r;
+            float disturbance = 0.0;
+
+            for (int i = 0; i < 10; i++) {
+              if (i >= uPointerCount) break;
+              vec4 finger = uPointers[i];
+              vec2 distVec = vUv - finger.xy;
+              distVec.x *= uAspect;
+              float dist = length(distVec);
+              float speed = finger.z;
+              float press = exp(-dist * 42.0);
+              float ring = exp(-pow(max(dist - 0.028, 0.0) * 28.0, 2.0));
+              disturbance += (-press * 0.020 + ring * 0.013) * (1.0 + speed * 8.0);
+            }
+
+            curr += disturbance;
+
+            float left = texture2D(uCurrTexture, vUv - vec2(uTexelSize.x, 0.0)).r;
+            float right = texture2D(uCurrTexture, vUv + vec2(uTexelSize.x, 0.0)).r;
+            float down = texture2D(uCurrTexture, vUv - vec2(0.0, uTexelSize.y)).r;
+            float up = texture2D(uCurrTexture, vUv + vec2(0.0, uTexelSize.y)).r;
+            float laplacian = (left + right + up + down) - 4.0 * curr;
+
+            float next = 2.0 * curr - prev + 0.24 * laplacian;
+            next *= 0.978;
+
+            for (int i = 0; i < 5; i++) {
+              float bx = uBubbleData[i * 4];
+              float by = uBubbleData[i * 4 + 1];
+              float bRadius = uBubbleData[i * 4 + 2];
+              float life = uBubbleData[i * 4 + 3];
+
+              if (bRadius > 0.0 && life > 0.0) {
+                vec2 bDelta = vUv - vec2(bx, by);
+                bDelta.x *= uAspect;
+                float bDist = length(bDelta);
+
+                if (life >= 1.0) {
+                  float centerBump = exp(-pow(bDist / max(bRadius * 0.7, 0.0001), 2.0)) * 0.25;
+                  float edgeRing = exp(-pow((bDist - bRadius * 0.85) / max(bRadius * 0.15, 0.0001), 2.0)) * 0.35;
+                  float bubbleShape = centerBump + edgeRing;
+                  float mask = smoothstep(bRadius * 1.1, bRadius * 0.8, bDist);
+                  next = mix(next, bubbleShape, mask * 0.6);
+                } else {
+                  float popRadius = bRadius * (2.0 - life);
+                  float popWave = exp(-pow(bDist - popRadius, 2.0) * 80.0) * life * 0.5;
+                  next += popWave;
+                }
+              }
+            }
+
+            gl_FragColor = vec4(next, 0.0, 0.0, 1.0);
+          }
+        `
+      });
+
+      const displayMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+          uHeightTexture: { value: currTarget.texture },
+          uVideoTexture: { value: videoTexture },
+          uTexelSize: { value: new THREE.Vector2(1 / width, 1 / height) },
+          uBubbleData: { value: bubbleData },
+          uAspect: { value: width / height }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = vec4(position.xy, 0.0, 1.0);
+          }
+        `,
+        fragmentShader: `
+          precision highp float;
+          varying vec2 vUv;
+          uniform sampler2D uHeightTexture;
+          uniform sampler2D uVideoTexture;
+          uniform vec2 uTexelSize;
+          uniform float uBubbleData[20];
+          uniform float uAspect;
+
+          void main() {
+            float h = texture2D(uHeightTexture, vUv).r;
+            float hLeft = texture2D(uHeightTexture, vUv - vec2(uTexelSize.x, 0.0)).r;
+            float hRight = texture2D(uHeightTexture, vUv + vec2(uTexelSize.x, 0.0)).r;
+            float hDown = texture2D(uHeightTexture, vUv - vec2(0.0, uTexelSize.y)).r;
+            float hUp = texture2D(uHeightTexture, vUv + vec2(0.0, uTexelSize.y)).r;
+
+            vec3 normal = normalize(vec3((hLeft - hRight) * 12.0, (hDown - hUp) * 12.0, 1.0));
+            vec2 refractUV = clamp(vUv + normal.xy * 0.035, 0.0, 1.0);
+            float r = texture2D(uVideoTexture, clamp(refractUV + normal.xy * 0.002, 0.0, 1.0)).r;
+            float g = texture2D(uVideoTexture, refractUV).g;
+            float b = texture2D(uVideoTexture, clamp(refractUV - normal.xy * 0.002, 0.0, 1.0)).b;
+            vec3 videoColor = vec3(r, g, b);
+
+            float ao = smoothstep(-0.1, 0.1, h);
+            videoColor *= 0.8 + 0.2 * ao;
+
+            vec3 lightDir = normalize(vec3(-0.45, 0.55, 1.0));
+            vec3 viewDir = vec3(0.0, 0.0, 1.0);
+            vec3 halfVec = normalize(lightDir + viewDir);
+            float spec = pow(max(dot(normal, halfVec), 0.0), 72.0);
+            float fresnel = pow(1.0 - max(dot(normal, viewDir), 0.0), 3.0);
+
+            vec3 finalColor = videoColor;
+            finalColor += vec3(1.0) * spec * 1.35;
+            finalColor += vec3(0.22, 0.45, 0.68) * fresnel * 0.22;
+
+            for (int i = 0; i < 5; i++) {
+              float bx = uBubbleData[i * 4];
+              float by = uBubbleData[i * 4 + 1];
+              float bRadius = uBubbleData[i * 4 + 2];
+              float life = uBubbleData[i * 4 + 3];
+
+              if (bRadius > 0.0 && life > 0.0) {
+                vec2 bDelta = vUv - vec2(bx, by);
+                bDelta.x *= uAspect;
+                float bDist = length(bDelta);
+                float currentRadius = bRadius;
+
+                if (bDist < currentRadius * 1.3) {
+                  float edge = smoothstep(currentRadius * 1.1, currentRadius * 0.8, bDist);
+                  float edgeHighlight = pow(edge, 3.0) * 1.5;
+
+                  vec2 lightOffset = vec2(-currentRadius * 0.4, currentRadius * 0.4);
+                  float topSpec = exp(-pow(length(bDelta - lightOffset) / max(currentRadius * 0.25, 0.0001), 2.0));
+
+                  vec2 bottomOffset = vec2(currentRadius * 0.3, -currentRadius * 0.3);
+                  float bottomSpec = exp(-pow(length(bDelta - bottomOffset) / max(currentRadius * 0.3, 0.0001), 2.0)) * 0.5;
+
+                  float alpha = (edgeHighlight + topSpec + bottomSpec) * max(life, 0.25);
+                  finalColor += vec3(0.9, 0.95, 1.0) * alpha;
+
+                  if (bDist < currentRadius * 0.95) {
+                    vec2 direction = bDist > 0.0001 ? bDelta / bDist : vec2(0.0);
+                    vec2 bubbleRefract = clamp(vUv + direction * 0.02 * max(life, 0.25), 0.0, 1.0);
+                    vec3 bubbleColor = texture2D(uVideoTexture, bubbleRefract).rgb;
+                    finalColor = mix(finalColor, bubbleColor * 1.2, 0.4 * max(life, 0.25));
+                  }
+                }
+              }
+            }
+
+            gl_FragColor = vec4(finalColor, 1.0);
+          }
+        `
+      });
+
+      simScene.add(new THREE.Mesh(quadGeo, simMaterial));
+      displayScene.add(new THREE.Mesh(quadGeo, displayMaterial));
+
+      function resetFingerVectors() {
+        for (let i = 0; i < MAX_POINTERS; i++) {
+          fingerVectors[i].set(-10, -10, 0, 0);
+        }
+      }
+
+      function addBubble(x, y) {
+        for (let i = 0; i < MAX_BUBBLES; i++) {
+          if (bubbleData[i * 4 + 3] <= 0.0) {
+            bubbleData[i * 4] = x;
+            bubbleData[i * 4 + 1] = y;
+            bubbleData[i * 4 + 2] = 0.07;
+            bubbleData[i * 4 + 3] = 1.0;
+            return;
+          }
+        }
+
+        bubbleData[0] = x;
+        bubbleData[1] = y;
+        bubbleData[2] = 0.07;
+        bubbleData[3] = 1.0;
+      }
+
+      function popTouchedBubbles() {
+        const aspect = width / height;
+
+        for (let f = 0; f < activeFingersCount; f++) {
+          const fx = fingerVectors[f].x;
+          const fy = fingerVectors[f].y;
+
+          for (let i = 0; i < MAX_BUBBLES; i++) {
+            if (bubbleData[i * 4 + 3] >= 1.0) {
+              const bx = bubbleData[i * 4];
+              const by = bubbleData[i * 4 + 1];
+              const bRadius = bubbleData[i * 4 + 2];
+              const dx = (fx - bx) * aspect;
+              const dy = fy - by;
+              const dist = Math.hypot(dx, dy);
+
+              if (dist < bRadius) {
+                bubbleData[i * 4 + 3] = 0.95;
+              }
+            }
+          }
+        }
+      }
+
+      function updateMousePointer(event) {
+        mousePointer.set(
+          event.clientX / window.innerWidth,
+          1.0 - event.clientY / window.innerHeight
+        );
+
+        pointerState[0].current.lerp(mousePointer, 0.35);
+        const velocity = pointerState[0].current.distanceTo(pointerState[0].previous);
+        fingerVectors[0].set(pointerState[0].current.x, pointerState[0].current.y, velocity, 1.0);
+        pointerState[0].previous.copy(pointerState[0].current);
+        activeFingersCount = 1;
+      }
+
+      function enableMouseFallback(message) {
+        usingCamera = false;
+        mouseFallback = true;
+        activeFingersCount = 0;
+        currentState = 0;
+        lastGrabState = false;
+        resetFingerVectors();
+        setDebug(message);
+      }
+
+      window.addEventListener("pointermove", (event) => {
+        if (!mouseFallback) return;
+        updateMousePointer(event);
+        if (!mouseDown) currentState = 0;
+      });
+
+      window.addEventListener("pointerdown", (event) => {
+        if (!mouseFallback) return;
+        mouseDown = true;
+        updateMousePointer(event);
+        currentState = 1;
+        if (!lastGrabState) {
+          addBubble(pointerState[0].current.x, pointerState[0].current.y);
+          lastGrabState = true;
+        }
+      });
+
+      window.addEventListener("pointerup", () => {
+        if (!mouseFallback) return;
+        mouseDown = false;
+        currentState = 0;
+        lastGrabState = false;
+      });
+
+      async function initCameraStream() {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false
+        });
+        videoElement.srcObject = stream;
+        await videoElement.play();
+        usingCamera = true;
+        mouseFallback = false;
+        setDebug("Camera active. Loading hand tracking...");
+      }
+
+      async function setupHands() {
+        try {
+          setDebug("Loading hand tracking...");
+          await loadMediaPipe();
+          await initCameraStream();
+
+          const hands = new window.Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+          });
+
+          hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+          });
+
+          hands.onResults((results) => {
+            if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+              activeFingersCount = 0;
+              currentState = 0;
+              lastGrabState = false;
+              resetFingerVectors();
+              if (usingCamera) setDebug("Camera active. Show your hand(s)!");
+              return;
+            }
+
+            activeFingersCount = 0;
+            resetFingerVectors();
+            let anyHandGrabbing = false;
+            let grabCenterX = 0.5;
+            let grabCenterY = 0.5;
+
+            for (let h = 0; h < results.multiHandLandmarks.length; h++) {
+              const landmarks = results.multiHandLandmarks[h];
+              const palmRef = landmarks[9];
+              let handOpenCount = 0;
+              let avgDistToPalm = 0;
+              let handCenterX = 0;
+              let handCenterY = 0;
+
+              for (let i = 0; i < 5 && activeFingersCount < MAX_POINTERS; i++) {
+                const tipIdx = fingertipIndices[i];
+                const tip = landmarks[tipIdx];
+                const distToPalm = Math.hypot(tip.x - palmRef.x, tip.y - palmRef.y);
+                avgDistToPalm += distToPalm;
+
+                const targetX = tip.x;
+                const targetY = 1.0 - tip.y;
+                handCenterX += targetX;
+                handCenterY += targetY;
+
+                if (distToPalm > 0.15) {
+                  const state = pointerState[activeFingersCount];
+                  state.current.x += (targetX - state.current.x) * 0.3;
+                  state.current.y += (targetY - state.current.y) * 0.3;
+
+                  const velocity = state.current.distanceTo(state.previous);
+                  fingerVectors[activeFingersCount].set(
+                    state.current.x,
+                    state.current.y,
+                    velocity,
+                    1.0
+                  );
+                  state.previous.copy(state.current);
+                  activeFingersCount += 1;
+                  handOpenCount += 1;
+                }
+              }
+
+              avgDistToPalm /= 5;
+              handCenterX /= 5;
+              handCenterY /= 5;
+
+              if (avgDistToPalm < 0.115 || handOpenCount <= 1) {
+                anyHandGrabbing = true;
+                grabCenterX = handCenterX;
+                grabCenterY = handCenterY;
+              }
+            }
+
+            if (anyHandGrabbing) {
+              currentState = 1;
+              if (!lastGrabState) addBubble(grabCenterX, grabCenterY);
+              lastGrabState = true;
+            } else {
+              currentState = 0;
+              lastGrabState = false;
+              popTouchedBubbles();
+            }
+
+            setDebug(
+              `Fingers: ${activeFingersCount} | State: ${
+                currentState === 1 ? "GRAB (Spawn Bubble)" : "Move (Pop Bubble)"
+              }`
+            );
+          });
+
+          const cameraFeed = new window.Camera(videoElement, {
+            onFrame: async () => { await hands.send({ image: videoElement }); },
+            width: 1280,
+            height: 720
+          });
+          cameraFeed.start();
+        } catch (error) {
+          enableMouseFallback(`Hand tracking unavailable. Mouse fallback active: ${error.message}`);
+        }
+      }
+
+      const clock = new THREE.Clock();
+
+      function animate() {
+        requestAnimationFrame(animate);
+        const time = clock.getElapsedTime();
+
+        if (mouseFallback) {
+          if (!mouseDown && activeFingersCount > 0) {
+            currentState = 0;
+            popTouchedBubbles();
+          }
+          if (mouseDown) {
+            currentState = 1;
+          }
+        }
+
+        for (let i = 0; i < MAX_BUBBLES; i++) {
+          const life = bubbleData[i * 4 + 3];
+          if (life > 0.0 && life < 1.0) {
+            bubbleData[i * 4 + 3] -= 0.04;
+            if (bubbleData[i * 4 + 3] <= 0.0) {
+              bubbleData[i * 4 + 3] = 0.0;
+              bubbleData[i * 4 + 2] = 0.0;
+            }
+          }
+        }
+
+        simMaterial.uniforms.uBubbleData.value = bubbleData;
+        displayMaterial.uniforms.uBubbleData.value = bubbleData;
+        simMaterial.uniforms.uPrevTexture.value = prevTarget.texture;
+        simMaterial.uniforms.uCurrTexture.value = currTarget.texture;
+        simMaterial.uniforms.uPointerCount.value = currentState === 0 ? activeFingersCount : 0;
+        simMaterial.uniforms.uTime.value = time;
+
+        for (let i = 0; i < MAX_POINTERS; i++) {
+          simMaterial.uniforms.uPointers.value[i].copy(fingerVectors[i]);
+        }
+
+        if (videoElement.readyState >= 2) {
+          videoTexture.needsUpdate = true;
+        }
+
+        renderer.setRenderTarget(nextTarget);
+        renderer.render(simScene, simCamera);
+
+        const oldPrev = prevTarget;
+        prevTarget = currTarget;
+        currTarget = nextTarget;
+        nextTarget = oldPrev;
+
+        displayMaterial.uniforms.uHeightTexture.value = currTarget.texture;
+
+        renderer.setRenderTarget(null);
+        renderer.render(displayScene, displayCamera);
+      }
+
+      window.addEventListener("resize", () => {
+        width = window.innerWidth;
+        height = window.innerHeight;
+        renderer.setSize(width, height);
+        prevTarget.setSize(width, height);
+        currTarget.setSize(width, height);
+        nextTarget.setSize(width, height);
+        simMaterial.uniforms.uTexelSize.value.set(1 / width, 1 / height);
+        simMaterial.uniforms.uAspect.value = width / height;
+        displayMaterial.uniforms.uTexelSize.value.set(1 / width, 1 / height);
+        displayMaterial.uniforms.uAspect.value = width / height;
+        clearTarget(prevTarget);
+        clearTarget(currTarget);
+        clearTarget(nextTarget);
+        renderer.setRenderTarget(null);
+      });
+
+      setupHands();
+      animate();
+    }
+
+    main().catch((error) => {
+      console.error(error);
+      setDebug(`Startup failed: ${error.message}`);
+    });
+  </script>
+</body>
+</html>
